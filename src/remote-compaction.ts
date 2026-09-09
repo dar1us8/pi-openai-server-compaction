@@ -32,6 +32,9 @@ import {
 
 type CompactionPreparation = SessionBeforeCompactEvent["preparation"];
 type AssistantPhase = "commentary" | "final_answer";
+type ProviderHeadersLike = Record<string, string | null>;
+type PiAiStreamHeaders = NonNullable<Parameters<typeof complete>[2]>["headers"];
+type PiCompactionHeaders = Parameters<typeof compact>[3];
 type ToolResultOutputItem =
   | { type: "input_text"; text: string }
   | { type: "input_image"; image_url: string };
@@ -198,49 +201,92 @@ function extractCodexAccountId(token: string): string {
   return accountId;
 }
 
+function mergeConcreteRequestHeaders(
+  ...sources: Array<ProviderHeadersLike | undefined>
+): Record<string, string> {
+  const merged: Record<string, string> = {};
+  for (const source of sources) {
+    for (const [name, value] of Object.entries(source ?? {})) {
+      for (const existingName of Object.keys(merged)) {
+        if (existingName.toLowerCase() === name.toLowerCase()) {
+          delete merged[existingName];
+        }
+      }
+      if (value !== null) merged[name] = value;
+    }
+  }
+  return merged;
+}
+
+function deletedHeaderNames(headers: ProviderHeadersLike | undefined): Set<string> {
+  const deleted = new Set<string>();
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    if (value === null) deleted.add(name.toLowerCase());
+  }
+  return deleted;
+}
+
+function withoutDeletedHeaders(
+  headers: Record<string, string>,
+  deleted: Set<string>,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(headers).filter(([name]) => !deleted.has(name.toLowerCase())),
+  );
+}
+
 function withRemoteCompactionV2Feature(headers: Record<string, string>): Record<string, string> {
   const configuredFeatures = Object.entries(headers)
     .find(([name]) => name.toLowerCase() === "x-codex-beta-features")?.[1]
     ?.split(",")
     .map((feature) => feature.trim())
     .filter(Boolean) ?? [];
-  const headersWithoutFeature = Object.fromEntries(
-    Object.entries(headers).filter(([name]) => name.toLowerCase() !== "x-codex-beta-features"),
-  );
   const features = [...new Set([...configuredFeatures, REMOTE_COMPACTION_V2_FEATURE])];
-  return {
-    ...headersWithoutFeature,
+  return mergeConcreteRequestHeaders(headers, {
     "x-codex-beta-features": features.join(","),
-  };
+  });
 }
 
 export function buildRemoteCompactionHeaders(params: {
   model: Model<any>;
   apiKey: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeadersLike;
   sessionId?: string;
 }): Record<string, string> {
-  const codexIdentityHeaders = buildCodexIdentityHeaders(params.sessionId);
-  const commonHeaders = withRemoteCompactionV2Feature({
-    authorization: `Bearer ${params.apiKey}`,
-    ...codexIdentityHeaders,
-    ...(params.headers ?? {}),
-    accept: "text/event-stream",
-    "content-type": "application/json",
-  });
-  if (isDirectOpenAIResponsesModel(params.model)) {
-    return commonHeaders;
+  const isCodex = isOpenAICodexResponsesModel(params.model);
+  if (!isDirectOpenAIResponsesModel(params.model) && !isCodex) {
+    throw new Error("Remote compaction v2 headers are not supported for this model.");
   }
-  if (isOpenAICodexResponsesModel(params.model)) {
-    return {
-      ...commonHeaders,
-      "chatgpt-account-id": extractCodexAccountId(params.apiKey),
-      originator: "pi",
-      "user-agent": `pi-openai-server-compaction (${platform()} ${release()}; ${arch()})`,
-      "OpenAI-Beta": "responses=experimental",
-    };
-  }
-  throw new Error("Remote compaction v2 headers are not supported for this model.");
+
+  const deletedByProvider = deletedHeaderNames(params.headers);
+  const codexRequestHeaders = isCodex
+    ? withoutDeletedHeaders(
+        {
+          // Resolved lazily: extraction throws on non-JWT credentials, so a provider
+          // that deletes this header must not force us to parse a key we never send.
+          ...(deletedByProvider.has("chatgpt-account-id")
+            ? {}
+            : { "chatgpt-account-id": extractCodexAccountId(params.apiKey) }),
+          originator: "pi",
+          "user-agent": `pi-openai-server-compaction (${platform()} ${release()}; ${arch()})`,
+          "OpenAI-Beta": "responses=experimental",
+        },
+        deletedByProvider,
+      )
+    : {};
+
+  return withRemoteCompactionV2Feature(mergeConcreteRequestHeaders(
+    {
+      authorization: `Bearer ${params.apiKey}`,
+      ...buildCodexIdentityHeaders(params.sessionId),
+    },
+    params.headers,
+    codexRequestHeaders,
+    {
+      accept: "text/event-stream",
+      "content-type": "application/json",
+    },
+  ));
 }
 
 function isAssistantPhase(value: unknown): value is AssistantPhase {
@@ -355,6 +401,25 @@ function buildPortableSummaryPrompt(conversation: string, customInstructions?: s
   return `Summarize this conversation for future continuation in pi. Preserve goals, decisions, important facts, file paths, open questions, and next steps. Be concise but include information needed to continue work.${instructionSuffix}\n\n<conversation>\n${conversation}\n</conversation>`;
 }
 
+/**
+ * Pi carries four message kinds that are not LLM roles - `custom` (context injected by
+ * extensions via `pi.sendMessage`), `bashExecution`, `branchSummary` and
+ * `compactionSummary` - and flattens each one into a user-role context message before it
+ * reaches the provider (`convertToLlm` in `@earendil-works/pi-agent-core`).
+ *
+ * The replacement history built from these items *replaces* Pi's own request input once a
+ * remote compaction exists, so a message that is not converted here is not merely missing
+ * from a cache: it is dropped from the request Pi intended to send. Mirror Pi's flattening
+ * so the replacement history keeps everything Pi would have sent.
+ */
+function nonLlmMessageToUserContent(message: AgentMessage): ResponseContentItem[] {
+  // Delegate to Pi's own flattening rather than re-deriving it, so this cannot drift from
+  // what Pi actually sends when Pi adds or changes a message kind.
+  const [flattened] = convertToLlm([message]);
+  if (!flattened || flattened.role !== "user") return [];
+  return contentToResponseContentItems(flattened.content);
+}
+
 export function messageToResponseItems(message: AgentMessage): ResponseItem[] {
   const items: ResponseItem[] = [];
 
@@ -417,6 +482,12 @@ export function messageToResponseItems(message: AgentMessage): ResponseItem[] {
       call_id: message.toolCallId.split("|", 1)[0],
       output: toolResultContentToOutput(message.content),
     });
+    return items;
+  }
+
+  const flattened = nonLlmMessageToUserContent(message);
+  if (flattened.length > 0) {
+    items.push({ type: "message", role: "user", content: flattened });
   }
 
   return items;
@@ -681,7 +752,7 @@ export async function generatePortableSummary(params: {
   messages: AgentMessage[];
   model: Model<any>;
   apiKey: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeadersLike;
   customInstructions?: string;
   signal?: AbortSignal;
   firstKeptEntryId: string;
@@ -701,7 +772,9 @@ export async function generatePortableSummary(params: {
     },
     {
       apiKey: params.apiKey,
-      headers: params.headers,
+      // Runtime identity is intentional: Pi 0.84+ accepts deletion markers,
+      // while older declarations only described string-valued headers.
+      headers: params.headers as PiAiStreamHeaders,
       maxTokens: 4096,
       signal: params.signal,
     },
@@ -725,7 +798,7 @@ export async function generateBestEffortLocalSummary(params: {
   messages: AgentMessage[];
   model: Model<any>;
   apiKey: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeadersLike;
   customInstructions?: string;
   signal?: AbortSignal;
   thinkingLevel?: ThinkingLevel;
@@ -739,7 +812,7 @@ export async function generateBestEffortLocalSummary(params: {
       params.preparation,
       params.model,
       params.apiKey,
-      params.headers,
+      params.headers as PiCompactionHeaders,
       params.customInstructions,
       params.signal,
       params.thinkingLevel,
@@ -919,7 +992,7 @@ export function parseRemoteCompactionV2Events(events: unknown[]): RemoteCompacti
 export async function callRemoteCompactionEndpoint(params: {
   model: Model<any>;
   apiKey: string;
-  headers?: Record<string, string>;
+  headers?: ProviderHeadersLike;
   sessionId?: string;
   input: ResponseItem[];
   instructions?: string;
@@ -1027,6 +1100,42 @@ function assistantMessageMatchesModelKey(
   return message.provider === target.provider && message.model === target.id;
 }
 
+/**
+ * Mirror of `sessionEntryToContextMessages` in `@earendil-works/pi-agent-core` for the
+ * entry kinds that carry LLM context. Extension messages are stored as `custom_message`
+ * entries rather than `message` entries, so a branch walk that only looks at
+ * `entry.type === "message"` silently loses them.
+ */
+export function branchEntryToContextMessage(entry: {
+  type: string;
+  message?: unknown;
+  [key: string]: unknown;
+}): AgentMessage | undefined {
+  if (entry.type === "message") return entry.message as AgentMessage | undefined;
+
+  if (entry.type === "custom_message") {
+    return {
+      role: "custom",
+      customType: String(entry.customType ?? ""),
+      content: entry.content,
+      display: entry.display !== false,
+      details: entry.details,
+      timestamp: Date.now(),
+    } as unknown as AgentMessage;
+  }
+
+  if (entry.type === "branch_summary" && typeof entry.summary === "string" && entry.summary) {
+    return {
+      role: "branchSummary",
+      summary: entry.summary,
+      fromId: String(entry.fromId ?? ""),
+      timestamp: Date.now(),
+    } as unknown as AgentMessage;
+  }
+
+  return undefined;
+}
+
 export function reconstructRemoteCompactionStateFromBranch(params: {
   branchEntries: Array<{ type: string; id: string; details?: unknown; message?: AgentMessage }>;
 }): RemoteCompactionSessionState | undefined {
@@ -1047,13 +1156,14 @@ export function reconstructRemoteCompactionStateFromBranch(params: {
   let pendingTurnItems: ResponseItem[] = [];
 
   for (const entry of params.branchEntries.slice(latestCompactionIndex + 1)) {
-    if (entry.type !== "message" || !entry.message) continue;
+    const message = branchEntryToContextMessage(entry);
+    if (!message) continue;
 
-    const items = messageToResponseItems(entry.message);
+    const items = messageToResponseItems(message);
     if (items.length === 0) continue;
 
-    if (entry.message.role === "assistant") {
-      if (assistantMessageMatchesModelKey(entry.message, latestDetails.modelKey)) {
+    if (message.role === "assistant") {
+      if (assistantMessageMatchesModelKey(message, latestDetails.modelKey)) {
         trailingMessages.push(...pendingTurnItems, ...items);
       }
       pendingTurnItems = [];
@@ -1062,6 +1172,11 @@ export function reconstructRemoteCompactionStateFromBranch(params: {
 
     pendingTurnItems.push(...items);
   }
+
+  // A turn that has not been answered yet - the common shape when a session is resumed or
+  // a branch is opened while the newest entry is still a user or extension message - must
+  // still reach the provider. Without this flush those items are buffered and discarded.
+  trailingMessages.push(...pendingTurnItems);
 
   return {
     compactionEntryId: latestCompactionEntryId,

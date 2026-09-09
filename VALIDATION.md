@@ -1,5 +1,11 @@
 # Validation
 
+## Pi compatibility and nullable headers
+
+Upstream PR #11 validated disposable exact peer installs for Pi `0.80.9`, `0.82.1`, `0.83.0`, `0.84.0`, and `0.84.1`. This compatibility port declares Pi through `0.85.1`, pins all three development peers to exact `0.85.1`, and runs strict typecheck and the deterministic smoke suite against that exact version. The smoke suite passes a `null` authorization-deletion marker through the actual pi-ai summary stream boundary unchanged, and separately captures the extension's direct `fetch` boundary to prove deletion markers are absent, all emitted request-header values are strings, and the generated bearer placeholder is not restored. Both the `openai/*` and `openai-codex/*` `fetch` boundaries are covered: null markers delete the generated Codex identity headers case-insensitively, generated identity values still take precedence over provider string values, and a no-null Codex header fixture remains covered. A deleted `chatgpt-account-id` marker is additionally covered with an opaque non-JWT credential, proving the extension does not parse the credential for an account id it will not send.
+
+One isolated exact-Pi-`0.84.1` `openai-codex/gpt-5.6-sol` canary completed real remote compaction and post-restart recall. It used only the Codex auth entry in a disposable mode-`0600` home, which was deleted immediately afterward.
+
 ## Current Responses compaction v2 validation
 
 The full live Pi RPC suite passes with both:
