@@ -75,8 +75,8 @@ pi -e ./src/index.ts --model openai/gpt-5.6-luna
 ## Requirements
 
 - Node `>= 22`
-- Pi `>=0.80.9 <=0.84.1`
-  - strict typecheck and deterministic smoke coverage: `0.80.9`, `0.82.1`, `0.83.0`, `0.84.0`, and exact `0.84.1`
+- Pi `>=0.80.9 <=0.85.1`
+  - this compatibility port's strict typecheck and deterministic smoke suite use exact Pi `0.85.1`
 - Auth/config for the model you want to use must already work in Pi
 - A supported OpenAI Responses model, e.g. `openai/gpt-5.6-sol` or `openai-codex/gpt-5.6-sol`
 
